@@ -10,24 +10,54 @@ import uuid
 # 1. Device (CPU/GPU)
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 2. Redefine your LSTMClassifier (exactly as in training)
-class LSTMClassifier(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes,
-                 bidirectional=True, dropout=0.5):
+# 2. Redefine your CNNLSTMClassifier (exactly as in training)
+class CNNLSTMClassifier(nn.Module):
+    def __init__(self,
+                 input_features: int,
+                 hidden_size: int,
+                 num_layers: int,
+                 num_classes: int,
+                 bidirectional: bool = True,
+                 dropout: float = 0.5):
         super().__init__()
-        self.bidirectional = bidirectional
-        self.hidden_size   = hidden_size
-        self.num_layers    = num_layers
 
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                            batch_first=True,
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=(3, 3), padding=(1, 1)),  # Conv2d: [B, 1, T, F] -> [B, 16, T, F]
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 2)),  # -> [B, 16, T//2, F//2]
+            
+            nn.Conv2d(16, 32, kernel_size=(3, 3), padding=(1, 1)),  # -> [B, 32, T//2, F//2]
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=(2, 2)),  # -> [B, 32, T//4, F//4]
+        )
+
+        self.lstm_input_size = 32 * (input_features // 4)  # Features after pooling
+        self.lstm = nn.LSTM(input_size=self.lstm_input_size,
+                            hidden_size=hidden_size,
+                            num_layers=num_layers,
                             bidirectional=bidirectional,
-                            dropout=dropout if num_layers>1 else 0.0)
+                            batch_first=True,
+                            dropout=dropout if num_layers > 1 else 0)
+
         self.dropout = nn.Dropout(dropout)
-        self.fc      = nn.Linear(hidden_size * (2 if bidirectional else 1),
-                                 num_classes)
+        self.fc = nn.Linear(hidden_size * (2 if bidirectional else 1), num_classes)
 
     def forward(self, x, lengths):
+        # x shape: [B, T, F]
+        x = x.unsqueeze(1)  # [B, 1, T, F]
+        x = self.conv(x)    # -> [B, 32, T//4, F//4]
+        B, C, T_new, F_new = x.size()
+        x = x.permute(0, 2, 1, 3).contiguous()  # [B, T_new, C, F_new]
+        x = x.view(B, T_new, -1)  # [B, T_new, C * F_new] = ready for LSTM
+
+        # Adjust lengths to account for two 2x pooling layers in time dimension
+        lengths = lengths // 4
+        # Make sure lengths are at least 1 and no greater than T_new
+        lengths = torch.clamp(lengths, min=1, max=T_new)
+        
+        # Pack sequence
         packed = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
         packed_out, (h_n, c_n) = self.lstm(packed)
 
@@ -45,14 +75,30 @@ class LSTMClassifier(nn.Module):
         logits = self.fc(out)
         return logits
 
+emotion2idx = {'angry': 0,
+ 'calm': 1,
+ 'disgust': 2,
+ 'fearful': 3,
+ 'happy': 4,
+ 'neutral': 5,
+ 'sad': 6,
+ 'surprised': 7}
+
 # 3. Instantiate & load your trained weights
 input_size  = 13 + 12   # MFCC + Chroma dims
 hidden_size = 128       # same as training
 num_layers  = 2
 num_classes = 8         # RAVDESS has 8 emotion labels
 
-model = LSTMClassifier(input_size, hidden_size, num_layers, num_classes)
-model.load_state_dict(torch.load('torch_lstm/best_lstm_emotion_run_2.pth', map_location=device))
+input_size   = 13 + 12             # MFCCs + Chroma
+hidden_size  = 128
+num_layers   = 2
+num_classes  = len(emotion2idx)
+lr           = 1e-3
+batch_size   = 32
+num_epochs   = 100
+model = CNNLSTMClassifier(input_size, hidden_size, num_layers, num_classes)
+model.load_state_dict(torch.load('torch_lstm/best_lstm_emotion_run_cnn_preoverfitting.pth', map_location=device))
 model.to(device)
 model.eval()
 
